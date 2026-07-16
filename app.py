@@ -1,285 +1,618 @@
-import sqlite3
-from flask import Flask, request, redirect, url_for, session, render_template_string, flash
-from werkzeug.security import generate_password_hash, check_password_hash
+import asyncio
+from typing import List, Optional
+from fastapi import FastAPI, HTTPException, status
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
+from sqlalchemy import String, Integer, select, update
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-app = Flask(__name__)
-app.secret_key = "super_secret_developer_key_luthfan"
-DB_NAME = "task_manager.db"
+# ---------------------------------------------------------
+# DATABASE CONFIGURATION (Async SQLite with WAL Mode)
+# ---------------------------------------------------------
+DATABASE_URL = "sqlite+aiosqlite:///sprintsync.db"
 
-# ==============================================================================
-# DATABASE SETUP
-# ==============================================================================
-def init_db():
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        # Users Table (Secure Password Hashing)
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE NOT NULL,
-                password TEXT NOT NULL
+class Base(DeclarativeBase):
+    pass
+
+class TaskModel(Base):
+    __tablename__ = "tasks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    title: Mapped[str] = mapped_column(String(100), nullable=False)
+    description: Mapped[str] = mapped_column(String(500), nullable=True)
+    status: Mapped[str] = mapped_column(String(50), default="Backlog")  # Backlog, Active Dev, Completed
+    priority: Mapped[str] = mapped_column(String(20), default="Medium")  # High, Medium, Low
+    story_points: Mapped[int] = mapped_column(Integer, default=1)
+    assignee_initials: Mapped[str] = mapped_column(String(4), default="DEV")
+
+engine = create_async_engine(DATABASE_URL, echo=False)
+async_session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+async def init_db():
+    async with engine.begin() as conn:
+        # Enable Write-Ahead Logging (WAL) for rapid non-blocking operations
+        await conn.exec_driver_sql("PRAGMA journal_mode=WAL;")
+        await conn.run_sync(Base.metadata.create_all)
+    
+    # Seed initial demo tasks if the database is completely empty
+    async with async_session() as session:
+        async with session.begin():
+            result = await session.execute(select(TaskModel))
+            if not result.scalars().first():
+                demo_tasks = [
+                    TaskModel(
+                        title="Configure OAuth2 Authentication", 
+                        description="Implement JWT authentication tokens and secure TLS connections across microservices.",
+                        status="Backlog", 
+                        priority="High", 
+                        story_points=5, 
+                        assignee_initials="AX"
+                    ),
+                    TaskModel(
+                        title="Optimize Database Query Performance", 
+                        description="Refactor database indices and isolate slow-running analytical operations.",
+                        status="Active Dev", 
+                        priority="Medium", 
+                        story_points=3, 
+                        assignee_initials="JD"
+                    ),
+                    TaskModel(
+                        title="Deploy Project Dashboard Dashboard UI", 
+                        description="Publish the core responsive terminal user interface to production environments.",
+                        status="Completed", 
+                        priority="Low", 
+                        story_points=2, 
+                        assignee_initials="CY"
+                    )
+                ]
+                session.add_all(demo_tasks)
+
+# ---------------------------------------------------------
+# PYDANTIC SCHEMAS
+# ---------------------------------------------------------
+class TaskSchema(BaseModel):
+    id: int
+    title: str
+    description: Optional[str] = ""
+    status: str
+    priority: str
+    story_points: int
+    assignee_initials: str
+
+    class Config:
+        from_attributes = True
+
+class TaskCreateSchema(BaseModel):
+    title: str = Field(..., min_length=1, max_length=100)
+    description: Optional[str] = Field("", max_length=500)
+    status: str = Field("Backlog", pattern="^(Backlog|Active Dev|Completed)$")
+    priority: str = Field("Medium", pattern="^(High|Medium|Low)$")
+    story_points: int = Field(1, ge=1, le=13)
+    assignee_initials: str = Field("DEV", min_length=1, max_length=4)
+
+class TaskStatusUpdateSchema(BaseModel):
+    status: str = Field(..., pattern="^(Backlog|Active Dev|Completed)$")
+
+# ---------------------------------------------------------
+# FASTAPI APP & LIFE-CYCLE
+# ---------------------------------------------------------
+app = FastAPI(title="SprintSync Dashboard")
+
+@app.on_event("startup")
+async def startup_event():
+    await init_db()
+
+# ---------------------------------------------------------
+# API ROUTER & ENDPOINTS
+# ---------------------------------------------------------
+@app.get("/api/tasks", response_model=List[TaskSchema])
+async def get_tasks():
+    async with async_session() as session:
+        result = await session.execute(select(TaskModel).order_by(TaskModel.id.asc()))
+        tasks = result.scalars().all()
+        return tasks
+
+@app.post("/api/tasks", response_model=TaskSchema, status_code=status.HTTP_201_CREATED)
+async def create_task(payload: TaskCreateSchema):
+    async with async_session() as session:
+        async with session.begin():
+            new_task = TaskModel(
+                title=payload.title,
+                description=payload.description,
+                status=payload.status,
+                priority=payload.priority,
+                story_points=payload.story_points,
+                assignee_initials=payload.assignee_initials.upper()
             )
-        ''')
-        # Tasks Table linked to Users
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                task_name TEXT NOT NULL,
-                priority TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'Pending',
-                FOREIGN KEY (user_id) REFERENCES users (id)
-            )
-        ''')
-        conn.commit()
+            session.add(new_task)
+        await session.refresh(new_task)
+        return new_task
 
-# ==============================================================================
-# FRONTEND UI (Tailwind CSS, Dashboard, Filters, and Modals)
-# ==============================================================================
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="en" class="h-full bg-slate-950 text-slate-100">
+@app.patch("/api/tasks/{task_id}/status", response_model=TaskSchema)
+async def update_task_status(task_id: int, payload: TaskStatusUpdateSchema):
+    async with async_session() as session:
+        async with session.begin():
+            result = await session.execute(select(TaskModel).where(TaskModel.id == task_id))
+            task = result.scalars().first()
+            if not task:
+                raise HTTPException(status_code=404, detail="Task not found")
+            
+            task.status = payload.status
+            session.add(task)
+        await session.refresh(task)
+        return task
+
+@app.delete("/api/tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_task(task_id: int):
+    async with async_session() as session:
+        async with session.begin():
+            result = await session.execute(select(TaskModel).where(TaskModel.id == task_id))
+            task = result.scalars().first()
+            if not task:
+                raise HTTPException(status_code=404, detail="Task not found")
+            await session.delete(task)
+    return HTMLResponse(status_code=204)
+
+# ---------------------------------------------------------
+# FRONTEND HTML CORE (Dark UI Theme with Standard English)
+# ---------------------------------------------------------
+HTML_CONTENT = """<!DOCTYPE html>
+<html lang="en" class="h-full bg-slate-950">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Luthfan's Task Hub</title>
+    <title>SprintSync // Project Dashboard</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        cyber: {
+                            black: '#030712',
+                            grayDark: '#0b0f19',
+                            grayMedium: '#111827',
+                            grayLight: '#1f2937',
+                            neonCyan: '#06b6d4',
+                            neonPurple: '#a855f7',
+                            neonMagenta: '#ec4899',
+                            neonGreen: '#10b981',
+                        }
+                    },
+                    boxShadow: {
+                        'neon-cyan': '0 0 10px rgba(6, 182, 212, 0.5), 0 0 2px rgba(6, 182, 212, 0.3)',
+                        'neon-purple': '0 0 10px rgba(168, 85, 247, 0.5), 0 0 2px rgba(168, 85, 247, 0.3)',
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;700&display=swap');
+        body {
+            font-family: 'Fira Code', monospace;
+        }
+        ::-webkit-scrollbar {
+            width: 6px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #0b0f19;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #1f2937;
+            border-radius: 3px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #06b6d4;
+        }
+    </style>
 </head>
-<body class="h-full flex flex-col font-sans">
+<body class="h-full text-slate-100 flex flex-col bg-cyber-black selection:bg-cyber-neonPurple selection:text-white">
 
-    <nav class="border-b border-slate-800 bg-slate-900 px-6 py-4 flex justify-between items-center">
+    <header class="border-b border-cyber-neonCyan/30 bg-cyber-grayDark/80 backdrop-blur-md sticky top-0 z-40 px-6 py-4 flex flex-col sm:flex-row items-center justify-between gap-4">
         <div class="flex items-center space-x-3">
-            <span class="text-2xl">⚡</span>
-            <span class="text-xl font-bold tracking-tight bg-gradient-to-r from-emerald-400 to-cyan-400 bg-clip-text text-transparent">Task Hub CLI-Web v1.0</span>
+            <div class="h-4 w-4 rounded-full bg-cyber-neonCyan animate-pulse shadow-neon-cyan"></div>
+            <div>
+                <h1 class="text-xl font-bold tracking-wider text-transparent bg-clip-text bg-gradient-to-r from-cyber-neonCyan to-cyber-neonPurple">
+                    SPRINTSYNC // MANAGEMENT
+                </h1>
+                <p class="text-xs text-slate-500 uppercase">Interactive Sprint & Kanban Board</p>
+            </div>
         </div>
-        {% if logged_in %}
-        <div class="flex items-center space-x-4">
-            <span class="text-slate-400">Welcome, <strong class="text-emerald-400">{{ username }}</strong></span>
-            <a href="/logout" class="px-3 py-1.5 text-xs font-semibold rounded bg-rose-950 text-rose-300 hover:bg-rose-900 border border-rose-800 transition">Log Out</a>
+
+        <div class="flex items-center space-x-6 bg-cyber-grayMedium border border-slate-800 rounded px-4 py-2 w-full sm:w-auto">
+            <div class="text-xs">
+                <span class="text-slate-500 uppercase block">Total Points</span>
+                <span id="telemetry-total" class="text-base font-bold text-cyber-neonCyan">0</span>
+            </div>
+            <div class="h-8 w-[1px] bg-slate-800"></div>
+            <div class="text-xs">
+                <span class="text-slate-500 uppercase block">Completed Points</span>
+                <span id="telemetry-completed" class="text-base font-bold text-cyber-neonGreen">0</span>
+            </div>
+            <div class="h-8 w-[1px] bg-slate-800"></div>
+            <div class="flex-1 sm:w-48">
+                <div class="flex justify-between text-[10px] text-slate-400 mb-1">
+                    <span>SPRINT VELOCITY</span>
+                    <span id="telemetry-percentage">0%</span>
+                </div>
+                <div class="w-full bg-slate-900 h-1.5 rounded overflow-hidden border border-slate-800">
+                    <div id="telemetry-progress" class="bg-gradient-to-r from-cyber-neonCyan to-cyber-neonPurple h-full transition-all duration-500 ease-out" style="width: 0%"></div>
+                </div>
+            </div>
         </div>
-        {% endif %}
-    </nav>
 
-    <main class="flex-grow p-6 max-w-6xl w-full mx-auto">
-        {% with messages = get_flashed_messages(with_categories=true) %}
-          {% if messages %}
-            {% for category, msg in messages %}
-              <div class="mb-4 p-4 rounded text-sm {% if category == 'error' %} bg-rose-950 text-rose-300 border border-rose-800 {% else %} bg-emerald-950 text-emerald-300 border border-emerald-800 {% endif %}">
-                  {{ msg }}
-              </div>
-            {% endfor %}
-          {% endif %}
-        {% endwith %}
+        <button onclick="toggleModal(true)" class="bg-gradient-to-r from-cyber-neonCyan to-cyber-neonPurple hover:from-cyber-neonCyan/80 hover:to-cyber-neonPurple/80 text-cyber-black font-semibold text-xs py-2 px-4 rounded shadow-neon-cyan transition-all duration-300 transform active:scale-95 flex items-center gap-1.5">
+            <span>+</span> CREATE TASK
+        </button>
+    </header>
 
-        {% if not logged_in %}
-        <div class="max-w-md mx-auto mt-16 bg-slate-900 border border-slate-800 rounded-xl p-8 shadow-2xl">
-            <h2 class="text-2xl font-bold mb-6 text-center text-slate-100">Access Portal</h2>
+    <main class="flex-1 p-6 overflow-x-auto">
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 h-full min-w-[900px] items-start">
             
-            <form action="/auth" method="POST" class="space-y-4">
-                <div>
-                    <label class="block text-xs font-semibold uppercase text-slate-400 mb-1">Username</label>
-                    <input type="text" name="username" required class="w-full bg-slate-950 border border-slate-800 rounded px-4 py-2 text-slate-100 focus:outline-none focus:border-emerald-500">
+            <div class="bg-cyber-grayDark/50 border border-slate-800 rounded-lg p-4 flex flex-col h-[calc(100vh-180px)] min-h-[450px]">
+                <div class="flex justify-between items-center pb-3 border-b border-slate-800 mb-4">
+                    <div class="flex items-center space-x-2">
+                        <span class="h-2 w-2 rounded-full bg-slate-400"></span>
+                        <h2 class="text-sm font-semibold tracking-widest text-slate-300 uppercase">BACKLOG</h2>
+                    </div>
+                    <span id="count-backlog" class="text-xs font-bold text-slate-500 border border-slate-800 rounded px-2 py-0.5">0</span>
                 </div>
-                <div>
-                    <label class="block text-xs font-semibold uppercase text-slate-400 mb-1">Password</label>
-                    <input type="password" name="password" required class="w-full bg-slate-950 border border-slate-800 rounded px-4 py-2 text-slate-100 focus:outline-none focus:border-emerald-500">
+                <div id="col-backlog" 
+                     class="flex-1 overflow-y-auto space-y-3 transition-colors duration-200" 
+                     ondragover="allowDrop(event)" 
+                     ondrop="drop(event, 'Backlog')"
+                     ondragenter="highlightColumn('col-backlog')"
+                     ondragleave="unhighlightColumn('col-backlog')">
                 </div>
-                <div class="grid grid-cols-2 gap-4 pt-4">
-                    <button type="submit" name="action" value="login" class="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-semibold py-2 rounded transition">Log In</button>
-                    <button type="submit" name="action" value="register" class="w-full bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold py-2 rounded border border-slate-700 transition">Register</button>
+            </div>
+
+            <div class="bg-cyber-grayDark/50 border border-slate-800 rounded-lg p-4 flex flex-col h-[calc(100vh-180px)] min-h-[450px]">
+                <div class="flex justify-between items-center pb-3 border-b border-slate-800 mb-4">
+                    <div class="flex items-center space-x-2">
+                        <span class="h-2 w-2 rounded-full bg-cyber-neonCyan animate-pulse"></span>
+                        <h2 class="text-sm font-semibold tracking-widest text-cyber-neonCyan uppercase">ACTIVE DEV</h2>
+                    </div>
+                    <span id="count-active" class="text-xs font-bold text-cyber-neonCyan border border-cyber-neonCyan/30 rounded px-2 py-0.5">0</span>
+                </div>
+                <div id="col-active" 
+                     class="flex-1 overflow-y-auto space-y-3 transition-colors duration-200" 
+                     ondragover="allowDrop(event)" 
+                     ondrop="drop(event, 'Active Dev')"
+                     ondragenter="highlightColumn('col-active')"
+                     ondragleave="unhighlightColumn('col-active')">
+                </div>
+            </div>
+
+            <div class="bg-cyber-grayDark/50 border border-slate-800 rounded-lg p-4 flex flex-col h-[calc(100vh-180px)] min-h-[450px]">
+                <div class="flex justify-between items-center pb-3 border-b border-slate-800 mb-4">
+                    <div class="flex items-center space-x-2">
+                        <span class="h-2 w-2 rounded-full bg-cyber-neonGreen"></span>
+                        <h2 class="text-sm font-semibold tracking-widest text-cyber-neonGreen uppercase">QA / COMPLETED</h2>
+                    </div>
+                    <span id="count-completed" class="text-xs font-bold text-cyber-neonGreen border border-cyber-neonGreen/30 rounded px-2 py-0.5">0</span>
+                </div>
+                <div id="col-completed" 
+                     class="flex-1 overflow-y-auto space-y-3 transition-colors duration-200" 
+                     ondragover="allowDrop(event)" 
+                     ondrop="drop(event, 'Completed')"
+                     ondragenter="highlightColumn('col-completed')"
+                     ondragleave="unhighlightColumn('col-completed')">
+                </div>
+            </div>
+
+        </div>
+    </main>
+
+    <div id="task-modal" class="hidden fixed inset-0 z-50 overflow-y-auto bg-cyber-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+        <div class="bg-cyber-grayDark border border-cyber-neonCyan/40 rounded-lg shadow-neon-purple max-w-md w-full p-6 relative">
+            <div class="absolute top-4 right-4">
+                <button onclick="toggleModal(false)" class="text-slate-500 hover:text-cyber-neonMagenta text-xl transition-colors">&times;</button>
+            </div>
+            <h3 class="text-base font-bold text-cyber-neonCyan mb-4 border-b border-slate-800 pb-2">CREATE NEW TASK</h3>
+            <form id="task-form" onsubmit="handleFormSubmit(event)">
+                <div class="mb-4">
+                    <label class="block text-xs uppercase text-slate-400 mb-1">Task Title *</label>
+                    <input type="text" id="form-title" required class="w-full bg-cyber-grayMedium border border-slate-800 rounded px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-cyber-neonCyan transition-all" placeholder="E.g., Integrate Service Engine">
+                </div>
+                <div class="mb-4">
+                    <label class="block text-xs uppercase text-slate-400 mb-1">Description</label>
+                    <textarea id="form-description" rows="3" class="w-full bg-cyber-grayMedium border border-slate-800 rounded px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-cyber-neonCyan transition-all" placeholder="Provide system configurations..."></textarea>
+                </div>
+                <div class="grid grid-cols-2 gap-4 mb-4">
+                    <div>
+                        <label class="block text-xs uppercase text-slate-400 mb-1">Priority</label>
+                        <select id="form-priority" class="w-full bg-cyber-grayMedium border border-slate-800 rounded px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-cyber-neonCyan transition-all">
+                            <option value="Low">Low</option>
+                            <option value="Medium" selected>Medium</option>
+                            <option value="High">High</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-xs uppercase text-slate-400 mb-1">Story Points</label>
+                        <select id="form-points" class="w-full bg-cyber-grayMedium border border-slate-800 rounded px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-cyber-neonCyan transition-all">
+                            <option value="1">1 pt</option>
+                            <option value="2">2 pts</option>
+                            <option value="3" selected>3 pts</option>
+                            <option value="5">5 pts</option>
+                            <option value="8">8 pts</option>
+                            <option value="13">13 pts</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="grid grid-cols-2 gap-4 mb-6">
+                    <div>
+                        <label class="block text-xs uppercase text-slate-400 mb-1">Assignee Initials</label>
+                        <input type="text" id="form-assignee" maxlength="4" value="DEV" class="w-full bg-cyber-grayMedium border border-slate-800 rounded px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-cyber-neonCyan transition-all uppercase">
+                    </div>
+                    <div>
+                        <label class="block text-xs uppercase text-slate-400 mb-1">Initial Status</label>
+                        <select id="form-status" class="w-full bg-cyber-grayMedium border border-slate-800 rounded px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-cyber-neonCyan transition-all">
+                            <option value="Backlog" selected>Backlog</option>
+                            <option value="Active Dev">Active Dev</option>
+                            <option value="Completed">Completed</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="flex justify-end space-x-3">
+                    <button type="button" onclick="toggleModal(false)" class="bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold text-xs py-2 px-4 rounded transition-all">CANCEL</button>
+                    <button type="submit" class="bg-gradient-to-r from-cyber-neonCyan to-cyber-neonPurple hover:from-cyber-neonCyan/85 hover:to-cyber-neonPurple/85 text-cyber-black font-semibold text-xs py-2 px-4 rounded shadow-neon-cyan transition-all">CREATE</button>
                 </div>
             </form>
         </div>
+    </div>
 
-        {% else %}
-        
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+    <script>
+        let allTasks = [];
+
+        // Fetch tasks and render on page load
+        async function loadTasks() {
+            try {
+                const response = await fetch('/api/tasks');
+                if (!response.ok) throw new Error("Could not fetch database records.");
+                allTasks = await response.json();
+                renderBoard();
+            } catch (err) {
+                console.error("Connection failure:", err);
+            }
+        }
+
+        // Render board layout dynamic cards & calculate telemetry values
+        function renderBoard() {
+            const colBacklog = document.getElementById('col-backlog');
+            const colActive = document.getElementById('col-active');
+            const colCompleted = document.getElementById('col-completed');
+
+            // Reset Columns
+            colBacklog.innerHTML = '';
+            colActive.innerHTML = '';
+            colCompleted.innerHTML = '';
+
+            let counts = { 'Backlog': 0, 'Active Dev': 0, 'Completed': 0 };
+            let totalStoryPoints = 0;
+            let completedStoryPoints = 0;
+
+            allTasks.forEach(task => {
+                totalStoryPoints += task.story_points;
+                if (task.status === 'Completed') {
+                    completedStoryPoints += task.story_points;
+                }
+
+                const card = createTaskCard(task);
+                if (task.status === 'Backlog') {
+                    colBacklog.appendChild(card);
+                    counts['Backlog']++;
+                } else if (task.status === 'Active Dev') {
+                    colActive.appendChild(card);
+                    counts['Active Dev']++;
+                } else {
+                    colCompleted.appendChild(card);
+                    counts['Completed']++;
+                }
+            });
+
+            // Update DOM Counts
+            document.getElementById('count-backlog').innerText = counts['Backlog'];
+            document.getElementById('count-active').innerText = counts['Active Dev'];
+            document.getElementById('count-completed').innerText = counts['Completed'];
+
+            // Update Telemetry Header
+            document.getElementById('telemetry-total').innerText = totalStoryPoints;
+            document.getElementById('telemetry-completed').innerText = completedStoryPoints;
             
-            <div class="bg-slate-900 border border-slate-800 rounded-xl p-6 h-fit">
-                <h3 class="text-lg font-bold mb-4 text-emerald-400">⚡ Add New Task</h3>
-                <form action="/add" method="POST" class="space-y-4">
-                    <div>
-                        <label class="block text-xs font-semibold uppercase text-slate-400 mb-1">Task Title</label>
-                        <input type="text" name="task_name" required placeholder="What needs doing?" class="w-full bg-slate-950 border border-slate-800 rounded px-4 py-2 text-slate-100 focus:outline-none focus:border-emerald-500">
-                    </div>
-                    <div>
-                        <label class="block text-xs font-semibold uppercase text-slate-400 mb-1">Priority</label>
-                        <select name="priority" class="w-full bg-slate-950 border border-slate-800 rounded px-4 py-2 text-slate-100 focus:outline-none focus:border-emerald-500">
-                            <option value="Low">🟢 Low</option>
-                            <option value="Medium" selected>🟡 Medium</option>
-                            <option value="High">🔴 High</option>
-                        </select>
-                    </div>
-                    <button type="submit" class="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-semibold py-2 rounded transition">Create Task</button>
-                </form>
-            </div>
+            const progressPercentage = totalStoryPoints > 0 ? Math.round((completedStoryPoints / totalStoryPoints) * 100) : 0;
+            document.getElementById('telemetry-percentage').innerText = progressPercentage + '%';
+            document.getElementById('telemetry-progress').style.width = progressPercentage + '%';
+        }
 
-            <div class="md:col-span-2 space-y-4">
-                
-                <div class="flex space-x-2 bg-slate-900 p-2 rounded-lg border border-slate-800 w-fit">
-                    <a href="/" class="px-4 py-1.5 rounded text-sm transition {% if current_filter == 'All' %} bg-emerald-600 text-white {% else %} text-slate-400 hover:text-slate-100 {% endif %}">All</a>
-                    <a href="/?filter=Pending" class="px-4 py-1.5 rounded text-sm transition {% if current_filter == 'Pending' %} bg-emerald-600 text-white {% else %} text-slate-400 hover:text-slate-100 {% endif %}">Pending</a>
-                    <a href="/?filter=Completed" class="px-4 py-1.5 rounded text-sm transition {% if current_filter == 'Completed' %} bg-emerald-600 text-white {% else %} text-slate-400 hover:text-slate-100 {% endif %}">Completed</a>
+        // Create individual card elements
+        function createTaskCard(task) {
+            const card = document.createElement('div');
+            card.id = `task-${task.id}`;
+            card.className = "bg-cyber-grayMedium border border-slate-800 hover:border-cyber-neonCyan/40 p-4 rounded shadow-md cursor-grab active:cursor-grabbing transition-all duration-300 relative group";
+            card.draggable = true;
+            card.ondragstart = (e) => drag(e, task.id);
+
+            // Priority styling map
+            const priorityColors = {
+                'High': 'bg-cyber-neonMagenta/20 text-cyber-neonMagenta border-cyber-neonMagenta/40',
+                'Medium': 'bg-cyber-neonPurple/20 text-cyber-neonPurple border-cyber-neonPurple/40',
+                'Low': 'bg-cyber-neonCyan/20 text-cyber-neonCyan border-cyber-neonCyan/40'
+            };
+            const priorityClass = priorityColors[task.priority] || priorityColors['Medium'];
+
+            card.innerHTML = `
+                <div class="flex justify-between items-start mb-2">
+                    <span class="text-[10px] uppercase font-bold tracking-wider px-2 py-0.5 rounded border ${priorityClass}">
+                        ${task.priority}
+                    </span>
+                    <button onclick="deleteTask(${task.id})" class="text-slate-600 hover:text-cyber-neonMagenta opacity-0 group-hover:opacity-100 transition-opacity duration-200 text-xs">
+                        &times; DELETE
+                    </button>
                 </div>
-
-                <div class="grid grid-cols-1 gap-4">
-                    {% if not tasks %}
-                    <div class="bg-slate-900 border border-slate-800 rounded-xl p-8 text-center text-slate-500">
-                        No tasks found. Get started by adding one!
+                <h4 class="text-xs font-bold text-slate-200 mb-1 group-hover:text-cyber-neonCyan transition-colors duration-200">${task.title}</h4>
+                <p class="text-[11px] text-slate-400 line-clamp-2 mb-4 leading-relaxed">${task.description || 'No additional details provided.'}</p>
+                <div class="flex justify-between items-center border-t border-slate-800/60 pt-3">
+                    <div class="flex items-center space-x-1">
+                        <span class="text-[10px] text-slate-500 uppercase">Weight:</span>
+                        <span class="text-xs font-bold text-slate-300">${task.story_points} SP</span>
                     </div>
-                    {% endif %}
+                    <div class="h-6 w-6 rounded-full bg-slate-800 border border-slate-700 flex items-center justify-center text-[10px] font-bold text-cyber-neonCyan" title="Assignee: ${task.assignee_initials}">
+                        ${task.assignee_initials}
+                    </div>
+                </div>
+            `;
+            return card;
+        }
+
+        // Native Drag-and-Drop Operations
+        function drag(event, taskId) {
+            event.dataTransfer.setData("text/plain", taskId);
+            // Dynamic slight visual dim when dragging
+            setTimeout(() => {
+                document.getElementById(`task-${taskId}`).classList.add('opacity-40');
+            }, 0);
+        }
+
+        document.addEventListener('dragend', (event) => {
+            const opacityCards = document.querySelectorAll('.opacity-40');
+            opacityCards.forEach(card => card.classList.remove('opacity-40'));
+        });
+
+        function allowDrop(event) {
+            event.preventDefault();
+        }
+
+        function highlightColumn(colId) {
+            document.getElementById(colId).classList.add('bg-cyber-neonCyan/5');
+        }
+
+        function unhighlightColumn(colId) {
+            document.getElementById(colId).classList.remove('bg-cyber-neonCyan/5');
+        }
+
+        async function drop(event, targetStatus) {
+            event.preventDefault();
+            const taskIdStr = event.dataTransfer.getData("text/plain");
+            const taskId = parseInt(taskIdStr, 10);
+            
+            // Remove highlight states
+            document.getElementById('col-backlog').classList.remove('bg-cyber-neonCyan/5');
+            document.getElementById('col-active').classList.remove('bg-cyber-neonCyan/5');
+            document.getElementById('col-completed').classList.remove('bg-cyber-neonCyan/5');
+
+            if (!taskId) return;
+
+            // Optimistic Client update
+            const originalTasks = [...allTasks];
+            const taskIndex = allTasks.findIndex(t => t.id === taskId);
+            if (taskIndex > -1 && allTasks[taskIndex].status !== targetStatus) {
+                allTasks[taskIndex].status = targetStatus;
+                renderBoard();
+
+                // Fire persistence update to backend
+                try {
+                    const response = await fetch(`/api/tasks/${taskId}/status`, {
+                        method: 'PATCH',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ status: targetStatus })
+                    });
+                    if (!response.ok) throw new Error("Synchronization failure.");
                     
-                    {% for task in tasks %}
-                    <div class="bg-slate-900 border border-slate-800 rounded-xl p-5 flex items-center justify-between hover:border-slate-700 transition">
-                        <div class="flex items-center space-x-4">
-                            <form action="/complete/{{ task[0] }}" method="POST">
-                                <button type="submit" class="w-6 h-6 rounded-full border-2 border-slate-700 flex items-center justify-center hover:border-emerald-500 transition {% if task[3] == 'Completed' %} bg-emerald-500 border-emerald-500 text-white {% endif %}">
-                                    {% if task[3] == 'Completed' %}✓{% endif %}
-                                </button>
-                            </form>
-                            <div>
-                                <h4 class="font-semibold text-slate-100 {% if task[3] == 'Completed' %} line-through text-slate-500 {% endif %}">{{ task[1] }}</h4>
-                                <span class="inline-block text-[10px] font-bold tracking-wider uppercase px-2 py-0.5 mt-1 rounded {% if task[2] == 'High' %} bg-rose-950 text-rose-300 {% elif task[2] == 'Medium' %} bg-amber-950 text-amber-300 {% else %} bg-slate-800 text-slate-300 {% endif %}">
-                                    {{ task[2] }} Priority
-                                </span>
-                            </div>
-                        </div>
-                        
-                        <form action="/delete/{{ task[0] }}" method="POST">
-                            <button type="submit" class="text-slate-500 hover:text-rose-400 text-sm font-semibold transition">Delete</button>
-                        </form>
-                    </div>
-                    {% endfor %}
-                </div>
+                    const updatedTask = await response.json();
+                    allTasks[taskIndex] = updatedTask; // Sync updated state from backend
+                } catch (err) {
+                    console.error("Rolling back state transition due to server error:", err);
+                    allTasks = originalTasks; // Rollback UI if failed
+                    renderBoard();
+                }
+            } else {
+                const targetCard = document.getElementById(`task-${taskId}`);
+                if (targetCard) targetCard.classList.remove('opacity-40');
+            }
+        }
 
-            </div>
-        </div>
-        {% endif %}
-    </main>
+        // Delete Task Pipeline
+        async function deleteTask(taskId) {
+            const confirmed = confirm("Are you sure you want to permanently delete this task?");
+            if (!confirmed) return;
 
+            try {
+                const response = await fetch(`/api/tasks/${taskId}`, { method: 'DELETE' });
+                if (!response.ok) throw new Error("Delete operations failed.");
+                
+                allTasks = allTasks.filter(t => t.id !== taskId);
+                renderBoard();
+            } catch (err) {
+                console.error(err);
+                alert("Failed to delete task.");
+            }
+        }
+
+        // Modal Controls
+        function toggleModal(show) {
+            const modal = document.getElementById('task-modal');
+            if (show) {
+                modal.classList.remove('hidden');
+                document.getElementById('form-title').focus();
+            } else {
+                modal.classList.add('hidden');
+                document.getElementById('task-form').reset();
+            }
+        }
+
+        // Task Creation Form Execution
+        async function handleFormSubmit(event) {
+            event.preventDefault();
+
+            const title = document.getElementById('form-title').value;
+            const description = document.getElementById('form-description').value;
+            const priority = document.getElementById('form-priority').value;
+            const story_points = parseInt(document.getElementById('form-points').value, 10);
+            const assignee_initials = document.getElementById('form-assignee').value || 'DEV';
+            const status = document.getElementById('form-status').value;
+
+            try {
+                const response = await fetch('/api/tasks', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        title,
+                        description,
+                        priority,
+                        story_points,
+                        assignee_initials,
+                        status
+                    })
+                });
+
+                if (!response.ok) throw new Error("Failed to insert task.");
+                const newTask = await response.json();
+                
+                allTasks.push(newTask);
+                toggleModal(false);
+                renderBoard();
+            } catch (err) {
+                console.error(err);
+                alert("Creation validation error. Please check your data parameters.");
+            }
+        }
+
+        // Initial loading setup
+        window.addEventListener('DOMContentLoaded', loadTasks);
+    </script>
 </body>
 </html>
 """
 
-# ==============================================================================
-# ROUTING & CONTROLLER LOGIC
-# ==============================================================================
-@app.route('/')
-def index():
-    logged_in = 'user_id' in session
-    tasks = []
-    current_filter = request.args.get('filter', 'All')
-    
-    if logged_in:
-        with sqlite3.connect(DB_NAME) as conn:
-            cursor = conn.cursor()
-            if current_filter == 'All':
-                cursor.execute("SELECT id, task_name, priority, status FROM tasks WHERE user_id = ?", (session['user_id'],))
-            else:
-                cursor.execute("SELECT id, task_name, priority, status FROM tasks WHERE user_id = ? AND status = ?", (session['user_id'], current_filter))
-            tasks = cursor.fetchall()
-            
-    return render_template_string(
-        HTML_TEMPLATE, 
-        logged_in=logged_in, 
-        username=session.get('username', ''), 
-        tasks=tasks,
-        current_filter=current_filter
-    )
+@app.get("/", response_class=HTMLResponse)
+async def serve_dashboard():
+    return HTMLResponse(content=HTML_CONTENT, status_code=200)
 
-@app.route('/auth', methods=['POST'])
-def auth():
-    username = request.form['username'].strip().lower()
-    password = request.form['password']
-    action = request.form['action']
-    
-    if not username or not password:
-        flash("Fields cannot be empty!", "error")
-        return redirect(url_for('index'))
-        
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        
-        if action == 'register':
-            try:
-                hashed_pw = generate_password_hash(password)
-                cursor.execute("INSERT INTO users (username, password) VALUES (?, ?)", (username, hashed_pw))
-                conn.commit()
-                flash("Registration successful! You can now log in.", "success")
-            except sqlite3.IntegrityError:
-                flash("Username is already taken!", "error")
-                
-        elif action == 'login':
-            cursor.execute("SELECT id, password FROM users WHERE username = ?", (username,))
-            user = cursor.fetchone()
-            if user and check_password_hash(user[1], password):
-                session['user_id'] = user[0]
-                session['username'] = username
-                flash("Logged in successfully!", "success")
-            else:
-                flash("Invalid login credentials!", "error")
-                
-    return redirect(url_for('index'))
-
-@app.route('/logout')
-def logout():
-    session.clear()
-    flash("Logged out successfully.", "success")
-    return redirect(url_for('index'))
-
-@app.route('/add', methods=['POST'])
-def add():
-    if 'user_id' not in session:
-        return redirect(url_for('index'))
-        
-    task_name = request.form['task_name'].strip()
-    priority = request.form['priority']
-    
-    if task_name:
-        with sqlite3.connect(DB_NAME) as conn:
-            cursor = conn.cursor()
-            cursor.execute("INSERT INTO tasks (user_id, task_name, priority) VALUES (?, ?, ?)", 
-                           (session['user_id'], task_name, priority))
-            conn.commit()
-            flash("Task added!", "success")
-            
-    return redirect(url_for('index'))
-
-@app.route('/complete/<int:task_id>', methods=['POST'])
-def complete(task_id):
-    if 'user_id' not in session:
-        return redirect(url_for('index'))
-        
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        # Verify ownership first
-        cursor.execute("SELECT status FROM tasks WHERE id = ? AND user_id = ?", (task_id, session['user_id']))
-        task = cursor.fetchone()
-        if task:
-            new_status = 'Pending' if task[0] == 'Completed' else 'Completed'
-            cursor.execute("UPDATE tasks SET status = ? WHERE id = ?", (new_status, task_id))
-            conn.commit()
-            
-    return redirect(url_for('index'))
-
-@app.route('/delete/<int:task_id>', methods=['POST'])
-def delete(task_id):
-    if 'user_id' not in session:
-        return redirect(url_for('index'))
-        
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM tasks WHERE id = ? AND user_id = ?", (task_id, session['user_id']))
-        conn.commit()
-        flash("Task deleted.", "success")
-        
-    return redirect(url_for('index'))
-
-# ==============================================================================
-# ENTRYPOINT
-# ==============================================================================
-if __name__ == '__main__':
-    init_db()
-    print("\n🚀 Full-Stack App initialized successfully!")
-    print("👉 Open http://127.0.0.1:5000 in your browser to test it.")
-    app.run(debug=True, port=5000)
+# ---------------------------------------------------------
+# RUNNER CONFIGURATION
+# ---------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=True)
